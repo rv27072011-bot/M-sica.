@@ -8,19 +8,90 @@ const THEMES = [
   { id: "slate",   name: "Ardósia",   bg: "#13151a", surface: "#1d2027", accent: "#9aa6ff", accent2: "#c9d0ff", text: "#eef0f7" },
 ];
 
-const STORAGE_KEY = "minhas-musicas:theme";
+const THEME_STORAGE_KEY = "minhas-musicas:theme";
+
+// ---------- IndexedDB (persistência real dos arquivos de música) ----------
+const DB_NAME = "minhas-musicas-db";
+const DB_VERSION = 1;
+const STORE_TRACKS = "tracks";
+const STORE_META = "meta";
+
+let db = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const _db = e.target.result;
+      if (!_db.objectStoreNames.contains(STORE_TRACKS)) {
+        _db.createObjectStore(STORE_TRACKS, { keyPath: "id" });
+      }
+      if (!_db.objectStoreNames.contains(STORE_META)) {
+        _db.createObjectStore(STORE_META, { keyPath: "key" });
+      }
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function idbPut(storeName, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function idbDelete(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.objectStore(storeName).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function idbGetAll(storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function idbGet(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function saveQueueMeta() {
+  try {
+    await idbPut(STORE_META, { key: "queue", value: queue });
+    await idbPut(STORE_META, { key: "currentIndex", value: currentIndex });
+  } catch (err) {
+    console.error("Erro salvando fila:", err);
+  }
+}
 
 // ---------- Estado ----------
-let tracks = [];      // {id, name, file, duration}
-let queue = [];        // array de ids na ordem de reprodução
+let tracks = [];
+let queue = [];
 let currentIndex = -1;
 let isPlaying = false;
-let repeatMode = "off"; // off | one | all
+let repeatMode = "off";
 let shuffleOn = false;
 let dragIndex = null;
 
 const audio = document.getElementById("audio");
 const fileInput = document.getElementById("file-input");
+const uploadLabel = document.getElementById("upload-label");
 const uploadError = document.getElementById("upload-error");
 const trackCountEl = document.getElementById("track-count");
 const coverEl = document.getElementById("cover");
@@ -48,7 +119,6 @@ const themeGrid = document.getElementById("theme-grid");
 const PLAY_ICON = '<path d="M8 5v14l11-7z"/>';
 const PAUSE_ICON = '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>';
 
-// ---------- Util ----------
 function formatTime(s) {
   if (!isFinite(s) || s < 0) return "0:00";
   const m = Math.floor(s / 60);
@@ -68,7 +138,11 @@ function currentTrack() {
   return tracks.find((t) => t.id === id) || null;
 }
 
-// ---------- Temas ----------
+function setUploadBusy(busy, label) {
+  uploadLabel.style.opacity = busy ? "0.6" : "1";
+  uploadLabel.querySelector("span").textContent = label;
+}
+
 function applyTheme(theme) {
   const root = document.documentElement.style;
   root.setProperty("--bg", theme.bg);
@@ -82,20 +156,20 @@ function applyTheme(theme) {
 }
 
 function loadTheme() {
-  const savedId = localStorage.getItem(STORAGE_KEY);
+  const savedId = localStorage.getItem(THEME_STORAGE_KEY);
   const theme = THEMES.find((t) => t.id === savedId) || THEMES[0];
   applyTheme(theme);
   return theme;
 }
 
 function saveTheme(theme) {
-  localStorage.setItem(STORAGE_KEY, theme.id);
+  localStorage.setItem(THEME_STORAGE_KEY, theme.id);
   applyTheme(theme);
 }
 
 function buildThemeGrid() {
   themeGrid.innerHTML = "";
-  const currentId = localStorage.getItem(STORAGE_KEY) || THEMES[0].id;
+  const currentId = localStorage.getItem(THEME_STORAGE_KEY) || THEMES[0].id;
   THEMES.forEach((theme) => {
     const btn = document.createElement("button");
     btn.className = "theme-swatch";
@@ -123,16 +197,15 @@ themeOverlay.addEventListener("click", (e) => {
   if (e.target === themeOverlay) themeOverlay.classList.add("hidden");
 });
 
-// ---------- Upload ----------
 const AUDIO_EXT = /\.(mp3|wav|m4a|aac|ogg|flac|wma|opus)$/i;
 
-fileInput.addEventListener("change", (e) => {
+fileInput.addEventListener("change", async (e) => {
   const files = Array.from(e.target.files || []);
-  handleFiles(files);
+  await handleFiles(files);
   e.target.value = "";
 });
 
-function handleFiles(files) {
+async function handleFiles(files) {
   if (files.length === 0) return;
   const audioFiles = files.filter((f) => f.type.startsWith("audio/") || AUDIO_EXT.test(f.name));
 
@@ -143,16 +216,29 @@ function handleFiles(files) {
   }
   uploadError.style.display = "none";
 
-  const newTracks = audioFiles.map((file) => ({
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-    name: file.name.replace(/\.[^/.]+$/, ""),
-    file,
-    url: URL.createObjectURL(file),
-    duration: 0,
-  }));
+  setUploadBusy(true, `Salvando 0/${audioFiles.length}...`);
 
-  tracks = tracks.concat(newTracks);
-  queue = queue.concat(newTracks.map((t) => t.id));
+  const newIds = [];
+  for (let i = 0; i < audioFiles.length; i++) {
+    const file = audioFiles[i];
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const name = file.name.replace(/\.[^/.]+$/, "");
+
+    try {
+      await idbPut(STORE_TRACKS, { id, name, blob: file, duration: 0 });
+      const url = URL.createObjectURL(file);
+      tracks.push({ id, name, blob: file, url, duration: 0 });
+      newIds.push(id);
+      setUploadBusy(true, `Salvando ${i + 1}/${audioFiles.length}...`);
+    } catch (err) {
+      console.error("Erro ao salvar música:", err);
+    }
+  }
+
+  queue = queue.concat(newIds);
+  await saveQueueMeta();
+
+  setUploadBusy(false, "Abrir gerenciador de arquivos");
   renderQueue();
   updateTrackCount();
 
@@ -165,7 +251,6 @@ function updateTrackCount() {
   trackCountEl.textContent = `${tracks.length} faixa${tracks.length !== 1 ? "s" : ""}`;
 }
 
-// ---------- Player ----------
 function loadTrackAt(index, autoplay = true) {
   const id = queue[index];
   const track = tracks.find((t) => t.id === id);
@@ -176,6 +261,7 @@ function loadTrackAt(index, autoplay = true) {
   renderCover();
   renderTrackInfo();
   renderQueue();
+  saveQueueMeta();
   if (autoplay) {
     audio.play().then(() => { isPlaying = true; updatePlayIcon(); }).catch(() => {
       isPlaying = false; updatePlayIcon();
@@ -269,12 +355,19 @@ audio.addEventListener("timeupdate", () => {
   timeCurrent.textContent = formatTime(audio.currentTime);
 });
 
-audio.addEventListener("loadedmetadata", () => {
+audio.addEventListener("loadedmetadata", async () => {
   timeTotal.textContent = formatTime(audio.duration);
   const track = currentTrack();
   if (track) {
     track.duration = audio.duration;
     renderQueue();
+    try {
+      const stored = await idbGet(STORE_TRACKS, track.id);
+      if (stored) {
+        stored.duration = audio.duration;
+        await idbPut(STORE_TRACKS, stored);
+      }
+    } catch (err) {}
   }
 });
 
@@ -305,7 +398,6 @@ volumeSlider.addEventListener("input", () => {
   volumeSlider.style.background = `linear-gradient(to right, var(--accent) ${v * 100}%, var(--bg) ${v * 100}%)`;
 });
 
-// ---------- Fila (drag-and-drop) ----------
 function renderQueue() {
   queueListEl.innerHTML = "";
   const queueTracks = queue.map((id) => tracks.find((t) => t.id === id)).filter(Boolean);
@@ -346,7 +438,6 @@ function renderQueue() {
       removeFromQueue(index);
     });
 
-    // Drag events (desktop)
     li.addEventListener("dragstart", () => { dragIndex = index; li.classList.add("dragging"); });
     li.addEventListener("dragend", () => { dragIndex = null; li.classList.remove("dragging"); clearDragOverStyles(); });
     li.addEventListener("dragover", (e) => {
@@ -360,7 +451,6 @@ function renderQueue() {
       clearDragOverStyles();
     });
 
-    // Touch support (mobile) via long-press handle drag
     setupTouchDrag(li, index);
 
     queueListEl.appendChild(li);
@@ -383,9 +473,10 @@ function reorderQueue(fromIndex, toIndex) {
   else if (fromIndex > currentIndex && toIndex <= currentIndex) currentIndex += 1;
 
   renderQueue();
+  saveQueueMeta();
 }
 
-function removeFromQueue(index) {
+async function removeFromQueue(index) {
   const removedId = queue[index];
   queue.splice(index, 1);
   tracks = tracks.filter((t) => t.id !== removedId);
@@ -401,14 +492,19 @@ function removeFromQueue(index) {
     currentIndex -= 1;
   }
   renderQueue();
+
+  try {
+    await idbDelete(STORE_TRACKS, removedId);
+    await saveQueueMeta();
+  } catch (err) {
+    console.error("Erro removendo música salva:", err);
+  }
 }
 
-// Touch drag-and-drop simples baseado na alça
 function setupTouchDrag(li, index) {
   const handle = li.querySelector(".handle");
   let startY = 0;
   let dragging = false;
-  let placeholder = null;
 
   handle.addEventListener("touchstart", (e) => {
     startY = e.touches[0].clientY;
@@ -461,43 +557,35 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-// ---------- Instalação do PWA ----------
-let deferredPrompt = null;
-const installBanner = document.getElementById("install-banner");
-const installGo = document.getElementById("install-go");
-const installDismiss = document.getElementById("install-dismiss");
-
-window.addEventListener("beforeinstallprompt", (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-  if (!localStorage.getItem("install-dismissed")) {
-    installBanner.classList.remove("hidden");
+async function loadPersistedData() {
+  try {
+    db = await openDB();
+  } catch (err) {
+    console.error("IndexedDB indisponível:", err);
+    return;
   }
-});
 
-installGo.addEventListener("click", async () => {
-  if (deferredPrompt) {
-    deferredPrompt.prompt();
-    await deferredPrompt.userChoice;
-    deferredPrompt = null;
-  }
-  installBanner.classList.add("hidden");
-});
+  try {
+    const [storedTracks, queueMeta, indexMeta] = await Promise.all([
+      idbGetAll(STORE_TRACKS),
+      idbGet(STORE_META, "queue"),
+      idbGet(STORE_META, "currentIndex"),
+    ]);
 
-installDismiss.addEventListener("click", () => {
-  installBanner.classList.add("hidden");
-  localStorage.setItem("install-dismissed", "1");
-});
+    tracks = storedTracks.map((t) => ({
+      id: t.id,
+      name: t.name,
+      blob: t.blob,
+      url: URL.createObjectURL(t.blob),
+      duration: t.duration || 0,
+    }));
 
-// ---------- Service worker ----------
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
-  });
-}
+    const savedQueue = (queueMeta && queueMeta.value) || [];
+    queue = savedQueue.filter((id) => tracks.some((t) => t.id === id));
+    tracks.forEach((t) => { if (!queue.includes(t.id)) queue.push(t.id); });
 
-// ---------- Init ----------
-loadTheme();
-renderQueue();
-updateTrackCount();
-volumeSlider.dispatchEvent(new Event("input"));
+    const savedIndex = (indexMeta && typeof indexMeta.value === "number") ? indexMeta.value : -1;
+    currentIndex = savedIndex >= 0 && savedIndex < queue.length ? savedIndex : -1;
+
+    renderQueue();
+    updateTr

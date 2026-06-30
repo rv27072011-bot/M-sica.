@@ -587,5 +587,53 @@ async function loadPersistedData() {
     const savedIndex = (indexMeta && typeof indexMeta.value === "number") ? indexMeta.value : -1;
     currentIndex = savedIndex >= 0 && savedIndex < queue.length ? savedIndex : -1;
 
-    renderQueue();
-    updateTr
+    ackCount();
+    if (currentIndex >= 0) {
+      const track = currentTrack();
+      if (track) {
+        audio.src = track.url;
+        renderCover();
+        renderTrackInfo();
+      }
+    }
+  } catch (err) {
+    console.error("Erro ao carregar dados salvos:", err);
+  }
+}
+
+let deferredPrompt = null;
+const installBanner = document.getElementById("install-banner");
+const installGo = document.getElementById("install-go");
+const installDismiss = document.getElementById("install-dismiss");
+
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  if (!localStorage.getItem("install-dismissed")) {
+    installBanner.classList.remove("hidden");
+  }
+});
+
+installGo.addEventListener("click", async () => {
+  if (deferredPrompt) {
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    deferredPrompt = null;
+  }
+  installBanner.classList.add("hidden");
+});
+
+installDismiss.addEventListener("click", () => {
+  installBanner.classList.add("hidden");
+  localStorage.setItem("install-dismissed", "1");
+});
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+
+loadTheme();
+volumeSlider.dispatchEvent(new Event("input"));
+loadPersistedData();
